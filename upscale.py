@@ -79,7 +79,6 @@ def upscale(
         net_in_full = (cv2.pow(np.clip(work_f, 0.0, 1.0), g) if g != 1.0 else work_f) * 2.0 - 1.0
 
     out_h, out_w = h * s, w * s
-    canvas = np.zeros((out_h, out_w, 3), dtype=np.float32)
     wx_list = feather_weights(xs, out_w, s, block, pad)
     wy_list = feather_weights(ys, out_h, s, block, pad)
     grid = [
@@ -89,6 +88,7 @@ def upscale(
     ]
 
     # Stream batches directly onto canvas (StandardCCImage::process 0x473fc + TBlockProc::mergeBlock 0x4edd4)
+    canvas = None
     for i in range(0, len(grid), batch_size):
         chunk = grid[i : i + batch_size]
         batch = np.stack([net_in_full[py : py + block, px : px + block] for py, px, *_ in chunk])
@@ -98,6 +98,21 @@ def upscale(
         if color_fn is not None:
             raw_batch = np.stack([work_f[py : py + block, px : px + block] for py, px, *_ in chunk])
             up = np.clip(color_fn(raw_batch, up * 2.0 - 1.0), 0.0, 1.0)
+        if canvas is None:
+            # Auto-adapt feather grid if the model's native scale factor (e.g. 4x ONNX) differs from snapped s
+            actual_s = up.shape[1] // block
+            if actual_s != s:
+                s = actual_s
+                out_h, out_w = h * s, w * s
+                wx_list = feather_weights(xs, out_w, s, block, pad)
+                wy_list = feather_weights(ys, out_h, s, block, pad)
+                grid = [
+                    (int(y + pad_t), int(x + pad_l), dy, ty0, ty1, wy[:, None, None], dx, tx0, tx1, wx[None, :, None])
+                    for y, (dy, ty0, ty1, wy) in zip(ys, wy_list)
+                    for x, (dx, tx0, tx1, wx) in zip(xs, wx_list)
+                ]
+                chunk = grid[i : i + batch_size]
+            canvas = np.zeros((out_h, out_w, 3), dtype=np.float32)
         for tile, (_, _, dy, ty0, ty1, wy_col, dx, tx0, tx1, wx_row) in zip(up, chunk):
             sub = tile[ty0:ty1, tx0:tx1] * wy_col
             sub *= wx_row
@@ -112,3 +127,18 @@ def upscale(
     if (merged_bgr.shape[1], merged_bgr.shape[0]) != (target_w, target_h):
         merged_bgr = cv2.resize(merged_bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
     return merged_bgr
+
+
+def make_onnx_fn(model_path: str, providers: list[str] | None = None):
+    """Wrap a standard NCHW [0, 1] ONNX super-resolution model into upscale_fn's NHWC [-1, 1] contract."""
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(model_path, providers=providers or ["CoreMLExecutionProvider", "CPUExecutionProvider"])
+    in_name = sess.get_inputs()[0].name
+
+    def _run(batch_nhwc_m11: np.ndarray) -> np.ndarray:
+        nchw_01 = np.ascontiguousarray((batch_nhwc_m11 * 0.5 + 0.5).transpose(0, 3, 1, 2))
+        out_nchw = sess.run(None, {in_name: nchw_01})[0]
+        return out_nchw.transpose(0, 2, 3, 1) * 2.0 - 1.0
+
+    return _run
