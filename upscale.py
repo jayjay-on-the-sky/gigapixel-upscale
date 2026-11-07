@@ -10,7 +10,7 @@ def grid_starts(dim: int, block: int, overlap: int, pad: int) -> np.ndarray:
     n = max(1, (padded - overlap + step - 1) // step)
     if n == 1:
         return np.array([-pad], dtype=np.int32)
-    return (np.arange(n, dtype=np.float32) * ((padded - block) / (n - 1))).astype(np.int32) - pad
+    return np.rint(np.linspace(0, padded - block, n)).astype(np.int32) - pad
 
 
 def feather_weights(starts: np.ndarray, out_dim: int, s: int, block: int = 128, pad: int = 4) -> list[tuple[int, int, int, np.ndarray]]:
@@ -44,18 +44,18 @@ def upscale(
     """
     Fast tiled upscale pipeline:
     1. Pad entire image once with BORDER_REFLECT_101 instead of per-tile copyMakeBorder.
-    2. Vectorize tile extraction and run model inference in batches.
+    2. Stream tiles in bounded batches directly onto the output canvas (no full-tile-set RAM spike).
     3. Precompute 1D linear feather ramps per row/col instead of per-tile.
     """
-    if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
-        raise ValueError("Expected HxWx3 BGR image")
+    if img_bgr.ndim != 3 or img_bgr.shape[2] != 3 or img_bgr.dtype != np.uint8:
+        raise ValueError("Expected HxWx3 uint8 BGR image")
     h, w = img_bgr.shape[:2]
-    if h < 1 or w < 1 or target_scale <= 0:
-        raise ValueError("Invalid dimensions or scale")
+    if h < 1 or w < 1 or target_scale <= 0 or overlap < 0 or discard < 0 or block <= overlap or batch_size < 1:
+        raise ValueError("Invalid dimensions, tiling parameters, or scale")
 
     # TBlockProc::TBlockProc (0x4dc00): snap model scale to nearest power of 2
     s = int(2 ** round(math.log2(max(target_scale, 1.0))))
-    pad = int(round(min(discard / float(overlap), 0.5) * overlap))
+    pad = 0 if overlap == 0 else int(round(min(discard / float(overlap), 0.5) * overlap))
 
     xs = grid_starts(w, block, overlap, pad)
     ys = grid_starts(h, block, overlap, pad)
@@ -69,44 +69,42 @@ def upscale(
     work = cv2.copyMakeBorder(img_bgr, pad_t, pad_b, pad_l, pad_r, border)
 
     # Normalize & BGR->RGB once on the full padded image instead of per tile
-    work_f = cv2.cvtColor(work, cv2.COLOR_BGR2RGB).astype(np.float32) * (1.0 / 255.0)
+    rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB).astype(np.float32)
     g = 0.45454545 if gamma else 1.0
-    net_in_full = (cv2.pow(np.clip(work_f, 0.0, 1.0), g) if g != 1.0 else work_f) * 2.0 - 1.0
+    if not gamma and color_fn is None:
+        net_in_full = rgb * (2.0 / 255.0) - 1.0
+        work_f = None
+    else:
+        work_f = rgb * (1.0 / 255.0)
+        net_in_full = (cv2.pow(np.clip(work_f, 0.0, 1.0), g) if g != 1.0 else work_f) * 2.0 - 1.0
 
-    coords = [(int(y + pad_t), int(x + pad_l)) for y in ys for x in xs]
-    patches_in = np.stack([net_in_full[y : y + block, x : x + block] for y, x in coords])
-
-    # Run model in batches (StandardCCImage::process 0x473fc)
-    out_batches = []
-    for i in range(0, len(patches_in), batch_size):
-        batch = patches_in[i : i + batch_size]
-        up = np.clip(upscale_fn(batch) * 0.5 + 0.5, 0.0, 1.0)
-        if g != 1.0:
-            up = cv2.pow(up, 1.0 / g)
-        if color_fn is not None:
-            raw_batch = np.stack([work_f[y : y + block, x : x + block] for y, x in coords[i : i + batch_size]])
-            up = np.clip(color_fn(raw_batch, up * 2.0 - 1.0), 0.0, 1.0)
-        out_batches.append(up)
-    tiles_out = np.concatenate(out_batches, axis=0)
-
-    # Merge tiles with precomputed 1D feather weights (TBlockProc::mergeBlock 0x4edd4)
-    # Since linear ramps on overlapping neighbors sum to 1.0, each tile is multiplied by its 2D weight and added directly without a second weights buffer or division pass.
     out_h, out_w = h * s, w * s
     canvas = np.zeros((out_h, out_w, 3), dtype=np.float32)
     wx_list = feather_weights(xs, out_w, s, block, pad)
     wy_list = feather_weights(ys, out_h, s, block, pad)
+    grid = [
+        (int(y + pad_t), int(x + pad_l), dy, ty0, ty1, wy[:, None, None], dx, tx0, tx1, wx[None, :, None])
+        for y, (dy, ty0, ty1, wy) in zip(ys, wy_list)
+        for x, (dx, tx0, tx1, wx) in zip(xs, wx_list)
+    ]
 
-    idx = 0
-    for dy, ty0, ty1, wy in wy_list:
-        wy_col = wy[:, None, None]
-        for dx, tx0, tx1, wx in wx_list:
-            sub = tiles_out[idx, ty0:ty1, tx0:tx1] * wy_col
-            sub *= wx[None, :, None]
+    # Stream batches directly onto canvas (StandardCCImage::process 0x473fc + TBlockProc::mergeBlock 0x4edd4)
+    for i in range(0, len(grid), batch_size):
+        chunk = grid[i : i + batch_size]
+        batch = np.stack([net_in_full[py : py + block, px : px + block] for py, px, *_ in chunk])
+        up = np.clip(upscale_fn(batch) * 0.5 + 0.5, 0.0, 1.0)
+        if g != 1.0:
+            up = cv2.pow(up, 1.0 / g)
+        if color_fn is not None:
+            raw_batch = np.stack([work_f[py : py + block, px : px + block] for py, px, *_ in chunk])
+            up = np.clip(color_fn(raw_batch, up * 2.0 - 1.0), 0.0, 1.0)
+        for tile, (_, _, dy, ty0, ty1, wy_col, dx, tx0, tx1, wx_row) in zip(up, chunk):
+            sub = tile[ty0:ty1, tx0:tx1] * wy_col
+            sub *= wx_row
             sh, sw = sub.shape[:2]
             canvas[dy : dy + sh, dx : dx + sw] += sub
-            idx += 1
 
-    merged_rgb = (canvas * 255.0 + 0.5).astype(np.uint8)
+    merged_rgb = np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
     merged_bgr = cv2.cvtColor(merged_rgb, cv2.COLOR_RGB2BGR)
 
     # ResizeEnhancement::postProc (0x615c0): Lanczos4 resize for fractional scales
