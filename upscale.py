@@ -142,3 +142,70 @@ def make_onnx_fn(model_path: str, providers: list[str] | None = None):
         return out_nchw.transpose(0, 2, 3, 1) * 2.0 - 1.0
 
     return _run
+
+
+def recover_faces(
+    img_bgr: np.ndarray,
+    gfpgan_path: str,
+    detector_path: str | None = None,
+    strength: float = 0.8,
+    providers: list[str] | None = None,
+) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+    """
+    Minimal reconstruction of FaceRecoveryEnhancement::proc (0x5cc18) + FaceEnhancement::facePerfect (0x27104):
+    1. Detect 5-point face landmarks via OpenCV YuNet ONNX (or Haar fallback).
+    2. Similarity-align face to GFPGAN's canonical 512x512 template -> run GFPGANv1.4 ONNX -> inverse-warp back.
+    3. Feather-blend restored face into the upscaled canvas with a smooth elliptical mask.
+    """
+    import onnxruntime as ort
+
+    h, w = img_bgr.shape[:2]
+    faces = None
+    if detector_path:
+        det = cv2.FaceDetectorYN.create(detector_path, "", (w, h), 0.6)
+        _, faces = det.detect(img_bgr)
+    if faces is None or len(faces) == 0:
+        return img_bgr, []
+
+    sess = ort.InferenceSession(gfpgan_path, providers=providers or ["CPUExecutionProvider"])
+    in_name = sess.get_inputs()[0].name
+    out = img_bgr.copy()
+
+    # Canonical FFHQ 512x512 5-point landmarks used by GFPGAN / CodeFormer
+    ref_pts = np.array(
+        [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935], [201.26117, 371.41043], [313.08905, 371.15118]],
+        dtype=np.float32,
+    )
+    yy, xx = np.ogrid[:512, :512]
+    dist = np.sqrt(((xx - 255.5) / 205.0) ** 2 + ((yy - 265.0) / 225.0) ** 2)
+    mask_512 = (np.clip(1.0 - np.clip((dist - 0.65) / 0.35, 0.0, 1.0), 0.0, 1.0) * strength).astype(np.float32)
+
+    applied = []
+    for row in faces:
+        fx, fy, fw, fh = [int(round(v)) for v in row[:4]]
+        src_pts = row[4:14].reshape(5, 2).astype(np.float32)
+        M, _ = cv2.estimateAffinePartial2D(src_pts, ref_pts, method=cv2.LMEDS)
+        if M is None:
+            continue
+
+        aligned_bgr = cv2.warpAffine(out, M, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+        aligned_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
+        inp = np.ascontiguousarray((aligned_rgb.astype(np.float32) * (2.0 / 255.0) - 1.0).transpose(2, 0, 1))[None]
+        pred = np.clip(sess.run(None, {in_name: inp})[0][0].transpose(1, 2, 0) * 0.5 + 0.5, 0.0, 1.0) * 255.0
+        restored_512 = cv2.cvtColor(pred.astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+        # Warp only onto the expanded face ROI instead of the full 4K/8K canvas
+        pad = int(max(fw, fh) * 0.35)
+        x0, y0 = max(0, fx - pad), max(0, fy - pad)
+        x1, y1 = min(w, fx + fw + pad), min(h, fy + fh + pad)
+        M_inv = cv2.invertAffineTransform(M)
+        M_inv[:, 2] -= [x0, y0]
+        roi = out[y0:y1, x0:x1]
+        rh, rw = roi.shape[:2]
+
+        warped_face = cv2.warpAffine(restored_512, M_inv, (rw, rh), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+        warped_mask = cv2.warpAffine(mask_512, M_inv, (rw, rh), flags=cv2.INTER_LINEAR)[..., None]
+        out[y0:y1, x0:x1] = np.clip(roi.astype(np.float32) * (1.0 - warped_mask) + warped_face.astype(np.float32) * warped_mask + 0.5, 0, 255).astype(np.uint8)
+        applied.append((x0, y0, x1 - x0, y1 - y0))
+
+    return out, applied
