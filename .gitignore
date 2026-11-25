@@ -1,1 +1,14 @@
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.DS_Store
+*.onnx
+*.jpg
+*.jpeg
+*.png
+*.mp4
+dist/
+build/
+*.egg-info/
