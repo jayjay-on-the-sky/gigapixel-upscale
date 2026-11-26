@@ -21,10 +21,13 @@ Minimal, fast Python tiled upscale pipeline with power-of-2 scale snapping, boun
 pip install numpy opencv-python onnxruntime
 ```
 
-Download models:
-- [realesr-general-x4v3.onnx](https://github.com/xinntao/Real-ESRGAN)
-- [face_detection_yunet_2023mar.onnx](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
-- [gfpgan_1.4.onnx](https://github.com/TencentARC/GFPGAN)
+### Download Pre-trained Models
+
+All ONNX model weights are hosted on Google Drive:
+- 📁 **[Google Drive Folder (All Models)](https://drive.google.com/drive/folders/1GQYws9PgH1GQdt8Oa66BqssjgxzsiHb-)**
+  - [realesr-general-x4v3.onnx](https://drive.google.com/file/d/1adNYSujjrL6cWyAvczFdrQSSZbzL7Kn1/view?usp=sharing) (4.6 MB)
+  - [face_detection_yunet_2023mar.onnx](https://drive.google.com/file/d/1ysDsFFPp7Y2PXOppDK3H5gS2ixRrurUC/view?usp=sharing) (227 KB)
+  - [gfpgan_1.4.onnx](https://drive.google.com/file/d/1YaojZgy6lbgrQFUZoSLbQG03lxSz6Gs7/view?usp=sharing) (325 MB)
 
 ### Usage
 
